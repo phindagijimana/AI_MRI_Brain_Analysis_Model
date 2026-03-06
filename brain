@@ -23,7 +23,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 import torch
 
@@ -177,6 +177,51 @@ def _strip_nii_suffix(path: Path) -> str:
     return path.stem
 
 
+def _is_t1_file(path: Path) -> bool:
+    name = path.name.lower()
+    stem = _strip_nii_suffix(path).lower()
+    return (
+        "_t1w" in stem
+        or "_t1n" in stem
+        or stem.endswith("_t1")
+        or stem.endswith("-t1")
+        or stem == "t1"
+        or name.startswith("t1")
+    )
+
+
+def _discover_idh_pairs(input_dir: Path) -> List[Tuple[Path, Path]]:
+    # Expected dual modalities for IDH task: *_t2f.nii.gz and *_t1ce.nii.gz
+    t2f_map = {}
+    t1ce_map = {}
+    for p in _discover_niftis(input_dir):
+        stem = _strip_nii_suffix(p).lower()
+        if stem.endswith("_t2f"):
+            base = stem[:-4]
+            t2f_map[base] = p
+        elif stem.endswith("_t1ce"):
+            base = stem[:-5]
+            t1ce_map[base] = p
+    pairs: List[Tuple[Path, Path]] = []
+    for base in sorted(set(t2f_map.keys()) & set(t1ce_map.keys())):
+        pairs.append((t2f_map[base], t1ce_map[base]))
+    return pairs
+
+
+def _find_idh_pair_for_single(input_path: Path) -> Tuple[Path, Path] | None:
+    stem = _strip_nii_suffix(input_path).lower()
+    parent = input_path.parent
+    if stem.endswith("_t2f"):
+        candidate = parent / f"{_strip_nii_suffix(input_path)[:-4]}_t1ce.nii.gz"
+        if candidate.exists():
+            return input_path, candidate
+    if stem.endswith("_t1ce"):
+        candidate = parent / f"{_strip_nii_suffix(input_path)[:-5]}_t2f.nii.gz"
+        if candidate.exists():
+            return candidate, input_path
+    return None
+
+
 def _maybe_write_segmentation_metrics(mask_path: Path, source_nifti: Path) -> None:
     if nib is None or np is None:
         return
@@ -215,13 +260,18 @@ def _collect_quantitative_outputs(output_dir: Path) -> None:
         image_path = payload.get("image_path", "")
         image_name = Path(image_path).name if image_path else ""
         subject_id = image_name.split("_")[0] if image_name else ""
+        age_months = payload.get("predicted_age_months", payload.get("predicted_age", ""))
+        age_years = payload.get("predicted_age_years", "")
+        if age_years == "" and isinstance(age_months, (int, float)):
+            age_years = float(age_months) / 12.0
         row = {
             "subject_id": subject_id,
             "image_name": image_name,
             "task": fp.parent.name,
             "source_file": str(fp),
             "checkpoint_path": payload.get("checkpoint_path", ""),
-            "predicted_age": payload.get("predicted_age", ""),
+            "predicted_age_months": age_months,
+            "predicted_age_years": age_years,
             "pred_prob": payload.get("pred_prob", ""),
             "pred_label": payload.get("pred_label", ""),
             "pred_logit": payload.get("pred_logit", ""),
@@ -242,7 +292,8 @@ def _collect_quantitative_outputs(output_dir: Path) -> None:
         "task",
         "source_file",
         "checkpoint_path",
-        "predicted_age",
+        "predicted_age_months",
+        "predicted_age_years",
         "pred_prob",
         "pred_label",
         "pred_logit",
@@ -524,14 +575,42 @@ def _run_single_task(task: str, nifti: Path, output_dir: Path, args: argparse.Na
     return subprocess.run(cmd, check=False).returncode
 
 
+def _run_idh_dual_task(nifti_t2f: Path, nifti_t1ce: Path, output_dir: Path, args: argparse.Namespace) -> int:
+    cmd = [
+        sys.executable,
+        str(SAL_IDH),
+        "--nifti_path",
+        str(nifti_t2f),
+        "--nifti_path2",
+        str(nifti_t1ce),
+        "--checkpoint_path",
+        str(_task_ckpt("idh", args)),
+        "--config_path",
+        str(args.config_path),
+        "--output_dir",
+        str(output_dir / "idh"),
+        "--simclr_checkpoint_path",
+        str(args.simclr_checkpoint_path),
+        "--layer",
+        str(args.layer),
+        "--img_size",
+        str(args.img_size[0]),
+        str(args.img_size[1]),
+        str(args.img_size[2]),
+        "--patch_size",
+        str(args.patch_size),
+    ]
+    return subprocess.run(cmd, check=False).returncode
+
+
 def cmd_models(args: argparse.Namespace) -> int:
     tasks = _resolve_tasks(args.tasks)
     if args.input is None and args.input_dir is None:
         raise SystemExit("models requires --input or --input-dir")
     if args.input is not None and args.input_dir is not None:
         raise SystemExit("models accepts only one of --input or --input-dir")
-    inputs = [args.input] if args.input else _discover_niftis(args.input_dir)
-    if not inputs:
+    all_inputs = [args.input] if args.input else _discover_niftis(args.input_dir)
+    if not all_inputs:
         raise SystemExit("No NIfTI files found.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -545,7 +624,46 @@ def cmd_models(args: argparse.Namespace) -> int:
             if args.fail_fast:
                 return 2
             continue
-        for nifti in inputs:
+
+        if task == "brainage":
+            task_inputs = [p for p in all_inputs if _is_t1_file(p)]
+            if not task_inputs:
+                print("[skip] task=brainage no T1-like inputs found (expected filenames like *_T1w.nii.gz)")
+                continue
+            for nifti in task_inputs:
+                rc = _run_single_task(task, nifti, args.output_dir, args)
+                if rc != 0:
+                    failures += 1
+                    if args.fail_fast:
+                        return rc
+            continue
+
+        if task == "idh":
+            if args.input is not None:
+                pair = _find_idh_pair_for_single(args.input)
+                if pair is None:
+                    print("[skip] task=idh single input requires paired *_t2f and *_t1ce files in the same folder")
+                    continue
+                rc = _run_idh_dual_task(pair[0], pair[1], args.output_dir, args)
+                if rc != 0:
+                    failures += 1
+                    if args.fail_fast:
+                        return rc
+                continue
+
+            pairs = _discover_idh_pairs(args.input_dir)
+            if not pairs:
+                print("[skip] task=idh no paired files found (expected *_t2f.nii.gz and *_t1ce.nii.gz)")
+                continue
+            for nifti_t2f, nifti_t1ce in pairs:
+                rc = _run_idh_dual_task(nifti_t2f, nifti_t1ce, args.output_dir, args)
+                if rc != 0:
+                    failures += 1
+                    if args.fail_fast:
+                        return rc
+            continue
+
+        for nifti in all_inputs:
             rc = _run_single_task(task, nifti, args.output_dir, args)
             if rc != 0:
                 failures += 1
@@ -571,6 +689,9 @@ def cmd_submit_models(args: argparse.Namespace) -> int:
         ok, reason = _validate_task_checkpoint(task, ckpt)
         if not ok:
             print(f"[skip] task={task} {reason}")
+            continue
+        if task == "idh":
+            print("[skip] task=idh submit-models is disabled until paired-input SLURM wrapping is configured")
             continue
         job_name = f"{args.job_prefix}_{task}"
         sbatch = [
@@ -600,6 +721,13 @@ def cmd_submit_models(args: argparse.Namespace) -> int:
                 "shopt -s globstar nullglob; "
                 f"for f in {str(args.input_dir / '**' / '*.nii.gz')}; do "
                 f"{_shell_join_allow_vars([sys.executable, str(SEG_SCRIPT), '--checkpoint_path', str(ckpt), '--simclr_checkpoint_path', str(args.simclr_checkpoint_path), '--image_path', fvar, '--output_dir', str(args.output_dir / 'segmentation'), '--gpu_device', args.gpu_device])}; "
+                "done"
+            )
+        elif task == "brainage":
+            inner = (
+                "shopt -s globstar nullglob; "
+                f"for f in {str(args.input_dir / '**' / '*_T1w.nii.gz')}; do "
+                f"{_shell_join_allow_vars([sys.executable, str(TASK_SCRIPT[task]), '--nifti_path', fvar, '--checkpoint_path', str(ckpt), '--config_path', str(args.config_path), '--output_dir', str(args.output_dir / task), '--simclr_checkpoint_path', str(args.simclr_checkpoint_path), '--layer', str(args.layer), '--img_size', str(args.img_size[0]), str(args.img_size[1]), str(args.img_size[2]), '--patch_size', str(args.patch_size)])}; "
                 "done"
             )
         else:
