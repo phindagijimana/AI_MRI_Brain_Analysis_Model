@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+"""
+Top-level CLI wrapper for Brain_Cal pipeline.
+
+Examples:
+  ./brain run --input /data/sub-01.nii.gz --output-dir outputs --mock
+  ./brain submit sub-01 --input /data/sub-01.nii.gz --output-dir outputs --mock --dry-run
+  ./brain submit cohort --input-dir /data/nifti --output-dir outputs --mock --dry-run
+  ./brain submit array --input-dir /data/nifti --output-dir outputs --mock --dry-run
+  ./brain age --input /data/sub-01_T1w.nii.gz --output-dir outputs
+  ./brain run-tasks segmentation brainage --input-dir /data --output-dir outputs
+  ./brain segment --input-dir Data_Brain --output-dir outputs_real_seg
+  ./brain submit-seg cohort --input-dir Data_Brain/sub-1 --output-dir outputs_real_slurm_sub1
+  ./brain status
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import List
+
+import torch
+
+try:
+    import nibabel as nib
+    import numpy as np
+except Exception:  # pragma: no cover
+    nib = None
+    np = None
+
+
+ROOT = Path(__file__).resolve().parent
+RUN_SCRIPT = ROOT / "infer_pipeline.py"
+SUBMIT_SCRIPT = ROOT / "slurm_submit.py"
+SEG_SCRIPT = ROOT / "BrainIAC_upstream" / "src" / "generate_segmentation.py"
+SAL_BRAINAGE = ROOT / "BrainIAC_upstream" / "src" / "generate_brainage_vit_saliency.py"
+SAL_IDH = ROOT / "BrainIAC_upstream" / "src" / "generate_idh_vit_saliency.py"
+SAL_MCI_STROKE = ROOT / "BrainIAC_upstream" / "src" / "generate_mci_stroke_vit_saliency.py"
+SAL_SEQUENCE = ROOT / "BrainIAC_upstream" / "src" / "generate_multiclass_vit_saliency.py"
+SAL_SURVIVAL = ROOT / "BrainIAC_upstream" / "src" / "generate_os_vit_saliency.py"
+DEFAULT_CONFIG = ROOT / "BrainIAC_upstream" / "src" / "config_finetune.yml"
+DEFAULT_SEG_CKPT = ROOT / "checkpoints_real" / "segmentation.ckpt"
+DEFAULT_SIMCLR_CKPT = ROOT / "checkpoints_real" / "BrainIAC.ckpt"
+DEFAULT_TASK_CKPTS = {
+    "brainage": ROOT / "checkpoints_real" / "brainage.ckpt",
+    "idh": ROOT / "checkpoints_real" / "idh.ckpt",
+    "mci": ROOT / "checkpoints_real" / "vit_mci.ckpt",
+    "stroke": ROOT / "checkpoints_real" / "stroke.ckpt",
+    "sequence": ROOT / "checkpoints_real" / "sequence_classifcation.ckpt",
+    # Expect a ViT-compatible survival checkpoint (typically os.ckpt).
+    "survival": ROOT / "checkpoints_real" / "os.ckpt",
+    "segmentation": DEFAULT_SEG_CKPT,
+}
+TASK_SCRIPT = {
+    "brainage": SAL_BRAINAGE,
+    "idh": SAL_IDH,
+    "mci": SAL_MCI_STROKE,
+    "stroke": SAL_MCI_STROKE,
+    "sequence": SAL_SEQUENCE,
+    "survival": SAL_SURVIVAL,
+}
+ALL_TASKS = ["brainage", "idh", "mci", "stroke", "sequence", "survival", "segmentation"]
+
+
+def _append_optional(args_list: List[str], flag: str, value: object | None) -> None:
+    if value is not None:
+        args_list.extend([flag, str(value)])
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    cmd: List[str] = [sys.executable, str(RUN_SCRIPT)]
+    if args.input is not None:
+        cmd += ["--input", str(args.input)]
+    if args.input_dir is not None:
+        cmd += ["--input-dir", str(args.input_dir)]
+    cmd += ["--output-dir", str(args.output_dir)]
+
+    _append_optional(cmd, "--model-path", args.model_path)
+    _append_optional(cmd, "--model-meta", args.model_meta)
+    cmd += ["--task", args.task, "--sequence", args.sequence]
+    cmd += ["--target-spacing", str(args.target_spacing)]
+    cmd += ["--target-shape", str(args.target_shape[0]), str(args.target_shape[1]), str(args.target_shape[2])]
+    cmd += ["--device", args.device, "--seed", str(args.seed)]
+
+    if args.save_preprocessed:
+        cmd.append("--save-preprocessed")
+    if args.mock:
+        cmd.append("--mock")
+    if args.fail_fast:
+        cmd.append("--fail-fast")
+    if args.verbose:
+        cmd.append("--verbose")
+
+    return subprocess.run(cmd, check=False).returncode
+
+
+def cmd_submit(args: argparse.Namespace) -> int:
+    # First positional argument maps to mode:
+    #   sub-01 => single
+    #   cohort => cohort
+    #   array  => array
+    subject_or_mode = args.subject_or_mode
+    if subject_or_mode in {"cohort", "array"}:
+        mode = subject_or_mode
+    else:
+        mode = "single"
+
+    cmd: List[str] = [sys.executable, str(SUBMIT_SCRIPT), "--mode", mode, "--output-dir", str(args.output_dir)]
+
+    if mode == "single":
+        if args.input is None:
+            raise SystemExit("submit single mode requires --input")
+        cmd += ["--input", str(args.input)]
+    else:
+        if args.input_dir is None:
+            raise SystemExit(f"submit {mode} mode requires --input-dir")
+        cmd += ["--input-dir", str(args.input_dir)]
+
+    _append_optional(cmd, "--model-path", args.model_path)
+    _append_optional(cmd, "--model-meta", args.model_meta)
+    cmd += ["--task", args.task, "--sequence", args.sequence]
+    cmd += ["--target-spacing", str(args.target_spacing)]
+    cmd += ["--target-shape", str(args.target_shape[0]), str(args.target_shape[1]), str(args.target_shape[2])]
+    cmd += ["--device", args.device, "--seed", str(args.seed)]
+
+    # SLURM options
+    cmd += ["--job-name", args.job_name, "--time", args.time, "--cpus", str(args.cpus), "--mem", args.mem]
+    _append_optional(cmd, "--partition", args.partition)
+    _append_optional(cmd, "--account", args.account)
+    _append_optional(cmd, "--qos", args.qos)
+    _append_optional(cmd, "--gres", args.gres)
+    _append_optional(cmd, "--constraint", args.constraint)
+    _append_optional(cmd, "--chdir", args.chdir)
+    _append_optional(cmd, "--logs-dir", args.logs_dir)
+    if mode == "array":
+        cmd += ["--max-parallel", str(args.max_parallel)]
+
+    if args.save_preprocessed:
+        cmd.append("--save-preprocessed")
+    if args.mock:
+        cmd.append("--mock")
+    if args.fail_fast:
+        cmd.append("--fail-fast")
+    if args.verbose:
+        cmd.append("--verbose")
+    if args.dry_run:
+        cmd.append("--dry-run")
+
+    return subprocess.run(cmd, check=False).returncode
+
+
+def _discover_niftis(input_dir: Path) -> List[Path]:
+    return sorted(list(input_dir.rglob("*.nii")) + list(input_dir.rglob("*.nii.gz")))
+
+
+def _shell_join(parts: List[str]) -> str:
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def _shell_join_allow_vars(parts: List[str]) -> str:
+    """Shell-quote args but preserve simple shell vars like $f or "$f"."""
+    return " ".join(p if p.startswith("$") or p.startswith('"$') else shlex.quote(p) for p in parts)
+
+
+def _strip_nii_suffix(path: Path) -> str:
+    name = path.name
+    if name.endswith(".nii.gz"):
+        return name[:-7]
+    if name.endswith(".nii"):
+        return name[:-4]
+    return path.stem
+
+
+def _maybe_write_segmentation_metrics(mask_path: Path, source_nifti: Path) -> None:
+    if nib is None or np is None:
+        return
+    if not mask_path.exists():
+        return
+    try:
+        arr = np.asanyarray(nib.load(str(mask_path)).dataobj)
+        nonzero = int((arr > 0).sum())
+        total = int(arr.size)
+        metrics = {
+            "task": "segmentation",
+            "image_path": str(source_nifti),
+            "mask_path": str(mask_path),
+            "mask_shape": list(arr.shape),
+            "mask_nonzero_voxels": nonzero,
+            "mask_nonzero_fraction": float(nonzero / total) if total > 0 else 0.0,
+        }
+        metrics_path = mask_path.with_name(mask_path.name.replace(".nii.gz", "_metrics.json"))
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+    except Exception:
+        # Metrics are best-effort; inference outputs should still be considered successful.
+        return
+
+
+def _collect_quantitative_outputs(output_dir: Path) -> None:
+    rows = []
+    for fp in sorted(output_dir.rglob("*_prediction.json")) + sorted(output_dir.rglob("*_metrics.json")):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        image_path = payload.get("image_path", "")
+        image_name = Path(image_path).name if image_path else ""
+        subject_id = image_name.split("_")[0] if image_name else ""
+        row = {
+            "subject_id": subject_id,
+            "image_name": image_name,
+            "task": fp.parent.name,
+            "source_file": str(fp),
+            "checkpoint_path": payload.get("checkpoint_path", ""),
+            "predicted_age": payload.get("predicted_age", ""),
+            "pred_prob": payload.get("pred_prob", ""),
+            "pred_label": payload.get("pred_label", ""),
+            "pred_logit": payload.get("pred_logit", ""),
+            "mask_nonzero_voxels": payload.get("mask_nonzero_voxels", ""),
+            "mask_nonzero_fraction": payload.get("mask_nonzero_fraction", ""),
+            "mask_shape": payload.get("mask_shape", ""),
+        }
+        rows.append(row)
+
+    if not rows:
+        return
+
+    csv_path = output_dir / "quantitative_summary.csv"
+    json_path = output_dir / "quantitative_summary.json"
+    fields = [
+        "subject_id",
+        "image_name",
+        "task",
+        "source_file",
+        "checkpoint_path",
+        "predicted_age",
+        "pred_prob",
+        "pred_label",
+        "pred_logit",
+        "mask_nonzero_voxels",
+        "mask_nonzero_fraction",
+        "mask_shape",
+    ]
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2)
+    print(f"[summary] wrote {csv_path}")
+    print(f"[summary] wrote {json_path}")
+
+
+def cmd_segment(args: argparse.Namespace) -> int:
+    if args.input is None and args.input_dir is None:
+        raise SystemExit("segment requires one of --input or --input-dir")
+    if args.input is not None and args.input_dir is not None:
+        raise SystemExit("segment accepts only one of --input or --input-dir")
+
+    if not args.checkpoint_path.exists():
+        raise SystemExit(f"Missing checkpoint: {args.checkpoint_path}")
+    if not args.simclr_checkpoint_path.exists():
+        raise SystemExit(f"Missing backbone checkpoint: {args.simclr_checkpoint_path}")
+    if not SEG_SCRIPT.exists():
+        raise SystemExit(f"Missing segmentation script: {SEG_SCRIPT}")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    inputs = [args.input] if args.input is not None else _discover_niftis(args.input_dir)
+    if not inputs:
+        raise SystemExit("No NIfTI files found for segment command.")
+
+    failures = 0
+    for f in inputs:
+        cmd = [
+            sys.executable,
+            str(SEG_SCRIPT),
+            "--checkpoint_path",
+            str(args.checkpoint_path),
+            "--simclr_checkpoint_path",
+            str(args.simclr_checkpoint_path),
+            "--image_path",
+            str(f),
+            "--output_dir",
+            str(args.output_dir),
+            "--gpu_device",
+            args.gpu_device,
+        ]
+        rc = subprocess.run(cmd, check=False).returncode
+        if rc != 0:
+            failures += 1
+            if args.fail_fast:
+                return rc
+    return 0 if failures == 0 else 2
+
+
+def cmd_submit_seg(args: argparse.Namespace) -> int:
+    mode = "single"
+    if args.subject_or_mode in {"cohort"}:
+        mode = "cohort"
+
+    if not args.checkpoint_path.exists():
+        raise SystemExit(f"Missing checkpoint: {args.checkpoint_path}")
+    if not args.simclr_checkpoint_path.exists():
+        raise SystemExit(f"Missing backbone checkpoint: {args.simclr_checkpoint_path}")
+    if not SEG_SCRIPT.exists():
+        raise SystemExit(f"Missing segmentation script: {SEG_SCRIPT}")
+
+    if mode == "single":
+        if args.input is None:
+            raise SystemExit("submit-seg single mode requires --input")
+        if not args.input.exists():
+            raise SystemExit(f"Input file not found: {args.input}")
+    else:
+        if args.input_dir is None:
+            raise SystemExit("submit-seg cohort mode requires --input-dir")
+        if not args.input_dir.exists():
+            raise SystemExit(f"Input dir not found: {args.input_dir}")
+
+    args.logs_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    sbatch_cmd = [
+        "sbatch",
+        "--job-name",
+        args.job_name,
+        "--output",
+        str(args.logs_dir / "%x_%j.out"),
+        "--error",
+        str(args.logs_dir / "%x_%j.err"),
+        "--time",
+        args.time,
+        "--cpus-per-task",
+        str(args.cpus),
+        "--mem",
+        args.mem,
+    ]
+    _append_optional(sbatch_cmd, "--partition", args.partition)
+    _append_optional(sbatch_cmd, "--account", args.account)
+    _append_optional(sbatch_cmd, "--qos", args.qos)
+    _append_optional(sbatch_cmd, "--gres", args.gres)
+    _append_optional(sbatch_cmd, "--constraint", args.constraint)
+    _append_optional(sbatch_cmd, "--chdir", args.chdir)
+
+    if mode == "single":
+        inner = _shell_join(
+            [
+                sys.executable,
+                str(SEG_SCRIPT),
+                "--checkpoint_path",
+                str(args.checkpoint_path),
+                "--simclr_checkpoint_path",
+                str(args.simclr_checkpoint_path),
+                "--image_path",
+                str(args.input),
+                "--output_dir",
+                str(args.output_dir),
+                "--gpu_device",
+                args.gpu_device,
+            ]
+        )
+    else:
+        loop_pattern = str(args.input_dir / "**" / "*.nii.gz")
+        inner_cmd = _shell_join_allow_vars(
+            [
+                sys.executable,
+                str(SEG_SCRIPT),
+                "--checkpoint_path",
+                str(args.checkpoint_path),
+                "--simclr_checkpoint_path",
+                str(args.simclr_checkpoint_path),
+                "--image_path",
+                '"$f"',
+                "--output_dir",
+                str(args.output_dir),
+                "--gpu_device",
+                args.gpu_device,
+            ]
+        )
+        inner = (
+            "shopt -s globstar nullglob; "
+            f"for f in {loop_pattern}; do {inner_cmd}; done"
+        )
+
+    sbatch_cmd += ["--wrap", f"bash -lc {shlex.quote(inner)}"]
+    print("$ " + _shell_join(sbatch_cmd))
+    if args.dry_run:
+        return 0
+    return subprocess.run(sbatch_cmd, check=False).returncode
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    user = args.user if args.user else subprocess.check_output(["whoami"], text=True).strip()
+    rc1 = subprocess.run(["squeue", "-u", user], check=False).returncode
+    if args.job_ids:
+        rc2 = subprocess.run(
+            ["sacct", "-j", args.job_ids, "--format=JobID,JobName,State,Start,End", "-n"],
+            check=False,
+        ).returncode
+        return 0 if rc1 == 0 and rc2 == 0 else 1
+    return rc1
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    if args.path is None:
+        raise SystemExit("logs requires --path (file or directory)")
+    if args.path.is_file():
+        return subprocess.run(["sed", "-n", f"1,{args.lines}p", str(args.path)], check=False).returncode
+    if args.path.is_dir():
+        files = sorted(args.path.glob("*.log")) + sorted(args.path.glob("*.out")) + sorted(args.path.glob("*.err"))
+        if not files:
+            raise SystemExit(f"No log-like files found in {args.path}")
+        newest = max(files, key=lambda p: p.stat().st_mtime)
+        print(f"Showing: {newest}")
+        return subprocess.run(["sed", "-n", f"1,{args.lines}p", str(newest)], check=False).returncode
+    raise SystemExit(f"Path not found: {args.path}")
+
+
+def _resolve_tasks(raw_tasks: str) -> List[str]:
+    if raw_tasks.strip().lower() == "all":
+        return list(ALL_TASKS)
+    tasks = [t.strip().lower() for t in raw_tasks.split(",") if t.strip()]
+    unknown = [t for t in tasks if t not in ALL_TASKS]
+    if unknown:
+        raise SystemExit(f"Unknown task(s): {unknown}. Allowed: {ALL_TASKS}")
+    return tasks
+
+
+def _task_ckpt(task: str, args: argparse.Namespace) -> Path:
+    if args.checkpoint_map:
+        # format: task=path,task2=path2
+        pairs = {}
+        for item in args.checkpoint_map.split(","):
+            if "=" in item:
+                k, v = item.split("=", 1)
+                pairs[k.strip().lower()] = Path(v.strip())
+        if task in pairs:
+            return pairs[task]
+    return DEFAULT_TASK_CKPTS[task]
+
+
+def _validate_task_checkpoint(task: str, ckpt: Path) -> tuple[bool, str]:
+    if not ckpt.exists():
+        return False, f"missing checkpoint: {ckpt}"
+    try:
+        payload = torch.load(ckpt, map_location="cpu")
+    except Exception as exc:
+        return False, f"unable to load checkpoint ({type(exc).__name__}): {exc}"
+
+    if task == "survival":
+        # The current survival loader is ViT-based and expects ViT-style keys.
+        state = None
+        if isinstance(payload, dict):
+            if isinstance(payload.get("state_dict"), dict):
+                state = payload["state_dict"]
+            elif isinstance(payload.get("model_state_dict"), dict):
+                state = payload["model_state_dict"]
+        if isinstance(state, dict):
+            keys = list(state.keys())
+            if any(k.startswith("backbone.backbone.conv1") for k in keys):
+                return (
+                    False,
+                    "checkpoint appears ResNet-style (conv1 keys) and is not ViT-compatible. "
+                    "Provide a ViT survival checkpoint (e.g., os.ckpt) via --checkpoint-map survival=/path/os.ckpt",
+                )
+    return True, "ok"
+
+
+def _run_single_task(task: str, nifti: Path, output_dir: Path, args: argparse.Namespace) -> int:
+    if task == "segmentation":
+        seg_dir = output_dir / "segmentation"
+        cmd = [
+            sys.executable,
+            str(SEG_SCRIPT),
+            "--checkpoint_path",
+            str(_task_ckpt("segmentation", args)),
+            "--simclr_checkpoint_path",
+            str(args.simclr_checkpoint_path),
+            "--image_path",
+            str(nifti),
+            "--output_dir",
+            str(seg_dir),
+            "--gpu_device",
+            args.gpu_device,
+        ]
+        rc = subprocess.run(cmd, check=False).returncode
+        if rc == 0:
+            mask_path = seg_dir / f"{_strip_nii_suffix(nifti)}_seg.nii.gz"
+            _maybe_write_segmentation_metrics(mask_path, nifti)
+        return rc
+
+    script = TASK_SCRIPT[task]
+    cmd = [
+        sys.executable,
+        str(script),
+        "--nifti_path",
+        str(nifti),
+        "--checkpoint_path",
+        str(_task_ckpt(task, args)),
+        "--config_path",
+        str(args.config_path),
+        "--output_dir",
+        str(output_dir / task),
+        "--simclr_checkpoint_path",
+        str(args.simclr_checkpoint_path),
+        "--layer",
+        str(args.layer),
+        "--img_size",
+        str(args.img_size[0]),
+        str(args.img_size[1]),
+        str(args.img_size[2]),
+        "--patch_size",
+        str(args.patch_size),
+    ]
+    return subprocess.run(cmd, check=False).returncode
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    tasks = _resolve_tasks(args.tasks)
+    if args.input is None and args.input_dir is None:
+        raise SystemExit("models requires --input or --input-dir")
+    if args.input is not None and args.input_dir is not None:
+        raise SystemExit("models accepts only one of --input or --input-dir")
+    inputs = [args.input] if args.input else _discover_niftis(args.input_dir)
+    if not inputs:
+        raise SystemExit("No NIfTI files found.")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    failures = 0
+    for task in tasks:
+        ckpt = _task_ckpt(task, args)
+        ok, reason = _validate_task_checkpoint(task, ckpt)
+        if not ok:
+            print(f"[skip] task={task} {reason}")
+            failures += 1
+            if args.fail_fast:
+                return 2
+            continue
+        for nifti in inputs:
+            rc = _run_single_task(task, nifti, args.output_dir, args)
+            if rc != 0:
+                failures += 1
+                if args.fail_fast:
+                    return rc
+    _collect_quantitative_outputs(args.output_dir)
+    return 0 if failures == 0 else 2
+
+
+def cmd_submit_models(args: argparse.Namespace) -> int:
+    tasks = _resolve_tasks(args.tasks)
+    if args.input_dir is None:
+        raise SystemExit("submit-models requires --input-dir")
+    if not args.input_dir.exists():
+        raise SystemExit(f"Input dir not found: {args.input_dir}")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.logs_dir.mkdir(parents=True, exist_ok=True)
+
+    submitted = 0
+    fvar = '"$f"'
+    for task in tasks:
+        ckpt = _task_ckpt(task, args)
+        ok, reason = _validate_task_checkpoint(task, ckpt)
+        if not ok:
+            print(f"[skip] task={task} {reason}")
+            continue
+        job_name = f"{args.job_prefix}_{task}"
+        sbatch = [
+            "sbatch",
+            "--job-name",
+            job_name,
+            "--output",
+            str(args.logs_dir / "%x_%j.out"),
+            "--error",
+            str(args.logs_dir / "%x_%j.err"),
+            "--time",
+            args.time,
+            "--cpus-per-task",
+            str(args.cpus),
+            "--mem",
+            args.mem,
+        ]
+        _append_optional(sbatch, "--partition", args.partition)
+        _append_optional(sbatch, "--account", args.account)
+        _append_optional(sbatch, "--qos", args.qos)
+        _append_optional(sbatch, "--gres", args.gres)
+        _append_optional(sbatch, "--constraint", args.constraint)
+        _append_optional(sbatch, "--chdir", args.chdir)
+
+        if task == "segmentation":
+            inner = (
+                "shopt -s globstar nullglob; "
+                f"for f in {str(args.input_dir / '**' / '*.nii.gz')}; do "
+                f"{_shell_join_allow_vars([sys.executable, str(SEG_SCRIPT), '--checkpoint_path', str(ckpt), '--simclr_checkpoint_path', str(args.simclr_checkpoint_path), '--image_path', fvar, '--output_dir', str(args.output_dir / 'segmentation'), '--gpu_device', args.gpu_device])}; "
+                "done"
+            )
+        else:
+            script = TASK_SCRIPT[task]
+            inner = (
+                "shopt -s globstar nullglob; "
+                f"for f in {str(args.input_dir / '**' / '*.nii.gz')}; do "
+                f"{_shell_join_allow_vars([sys.executable, str(script), '--nifti_path', fvar, '--checkpoint_path', str(ckpt), '--config_path', str(args.config_path), '--output_dir', str(args.output_dir / task), '--simclr_checkpoint_path', str(args.simclr_checkpoint_path), '--layer', str(args.layer), '--img_size', str(args.img_size[0]), str(args.img_size[1]), str(args.img_size[2]), '--patch_size', str(args.patch_size)])}; "
+                "done"
+            )
+        sbatch += ["--wrap", f"bash -lc {shlex.quote(inner)}"]
+        print("$ " + _shell_join(sbatch))
+        if not args.dry_run:
+            subprocess.run(sbatch, check=False)
+        submitted += 1
+    return 0 if submitted > 0 else 2
+
+
+def _add_models_common_args(parser: argparse.ArgumentParser) -> None:
+    src_models = parser.add_mutually_exclusive_group(required=True)
+    src_models.add_argument("--input", type=Path)
+    src_models.add_argument("--input-dir", type=Path)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint-map", type=str, default=None, help="task=/path/file.ckpt comma-separated")
+    parser.add_argument("--config-path", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--simclr-checkpoint-path", type=Path, default=DEFAULT_SIMCLR_CKPT)
+    parser.add_argument("--gpu-device", type=str, default="cpu")
+    parser.add_argument("--layer", type=int, default=-1)
+    parser.add_argument("--img-size", nargs=3, type=int, default=(96, 96, 96))
+    parser.add_argument("--patch-size", type=int, default=16)
+    parser.add_argument("--fail-fast", action="store_true")
+
+
+def cmd_single_task_alias(args: argparse.Namespace) -> int:
+    # Map command alias to internal task name and forward to models runner.
+    alias_to_task = {
+        "age": "brainage",
+        "brainage": "brainage",
+        "idh": "idh",
+        "mci": "mci",
+        "stroke": "stroke",
+        "sequence": "sequence",
+        "survival": "survival",
+        "seg": "segmentation",
+    }
+    task = alias_to_task.get(args.command, args.command)
+    args.tasks = task
+    return cmd_models(args)
+
+
+def cmd_run_tasks(args: argparse.Namespace) -> int:
+    args.tasks = ",".join(args.task_names)
+    return cmd_models(args)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="brain", description="Brain pipeline top-level CLI")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="Run inference locally (single or batch)")
+    src = run.add_mutually_exclusive_group(required=True)
+    src.add_argument("--input", type=Path)
+    src.add_argument("--input-dir", type=Path)
+    run.add_argument("--output-dir", type=Path, required=True)
+    run.add_argument("--model-path", type=Path, default=None)
+    run.add_argument("--model-meta", type=Path, default=None)
+    run.add_argument("--task", choices=["auto", "segmentation", "classification", "regression"], default="auto")
+    run.add_argument("--sequence", choices=["unknown", "T1", "T2", "FLAIR", "T1CE"], default="unknown")
+    run.add_argument("--target-spacing", type=float, default=1.0)
+    run.add_argument("--target-shape", type=int, nargs=3, default=(96, 96, 96), metavar=("D", "H", "W"))
+    run.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    run.add_argument("--seed", type=int, default=42)
+    run.add_argument("--save-preprocessed", action="store_true")
+    run.add_argument("--mock", action="store_true")
+    run.add_argument("--fail-fast", action="store_true")
+    run.add_argument("--verbose", action="store_true")
+    run.set_defaults(func=cmd_run)
+
+    submit = sub.add_parser("submit", help="Submit inference to SLURM")
+    submit.add_argument(
+        "subject_or_mode",
+        help="Use subject label (e.g. sub-01) for single mode, or explicit mode: cohort|array",
+    )
+    submit.add_argument("--input", type=Path, help="Required for single mode.")
+    submit.add_argument("--input-dir", type=Path, help="Required for cohort/array modes.")
+    submit.add_argument("--output-dir", type=Path, required=True)
+    submit.add_argument("--model-path", type=Path, default=None)
+    submit.add_argument("--model-meta", type=Path, default=None)
+    submit.add_argument("--task", choices=["auto", "segmentation", "classification", "regression"], default="auto")
+    submit.add_argument("--sequence", choices=["unknown", "T1", "T2", "FLAIR", "T1CE"], default="unknown")
+    submit.add_argument("--target-spacing", type=float, default=1.0)
+    submit.add_argument("--target-shape", type=int, nargs=3, default=(96, 96, 96), metavar=("D", "H", "W"))
+    submit.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    submit.add_argument("--seed", type=int, default=42)
+    submit.add_argument("--save-preprocessed", action="store_true")
+    submit.add_argument("--mock", action="store_true")
+    submit.add_argument("--fail-fast", action="store_true")
+    submit.add_argument("--verbose", action="store_true")
+
+    submit.add_argument("--job-name", type=str, default="brain_infer")
+    submit.add_argument("--partition", type=str, default=None)
+    submit.add_argument("--account", type=str, default=None)
+    submit.add_argument("--qos", type=str, default=None)
+    submit.add_argument("--time", type=str, default="02:00:00")
+    submit.add_argument("--cpus", type=int, default=4)
+    submit.add_argument("--mem", type=str, default="16G")
+    submit.add_argument("--gres", type=str, default=None)
+    submit.add_argument("--constraint", type=str, default=None)
+    submit.add_argument("--max-parallel", type=int, default=10)
+    submit.add_argument("--chdir", type=Path, default=None)
+    submit.add_argument("--logs-dir", type=Path, default=ROOT / "slurm_logs")
+    submit.add_argument("--dry-run", action="store_true")
+    submit.set_defaults(func=cmd_submit)
+
+    segment = sub.add_parser("segment", help="Run real BrainIAC segmentation locally")
+    src_seg = segment.add_mutually_exclusive_group(required=True)
+    src_seg.add_argument("--input", type=Path)
+    src_seg.add_argument("--input-dir", type=Path)
+    segment.add_argument("--output-dir", type=Path, required=True)
+    segment.add_argument("--checkpoint-path", type=Path, default=DEFAULT_SEG_CKPT)
+    segment.add_argument("--simclr-checkpoint-path", type=Path, default=DEFAULT_SIMCLR_CKPT)
+    segment.add_argument("--gpu-device", type=str, default="cpu")
+    segment.add_argument("--fail-fast", action="store_true")
+    segment.set_defaults(func=cmd_segment)
+
+    submit_seg = sub.add_parser("submit-seg", help="Submit real BrainIAC segmentation to SLURM")
+    submit_seg.add_argument(
+        "subject_or_mode",
+        help="Use subject label for single mode, or explicit mode: cohort",
+    )
+    submit_seg.add_argument("--input", type=Path, help="Required for single mode.")
+    submit_seg.add_argument("--input-dir", type=Path, help="Required for cohort mode.")
+    submit_seg.add_argument("--output-dir", type=Path, required=True)
+    submit_seg.add_argument("--checkpoint-path", type=Path, default=DEFAULT_SEG_CKPT)
+    submit_seg.add_argument("--simclr-checkpoint-path", type=Path, default=DEFAULT_SIMCLR_CKPT)
+    submit_seg.add_argument("--gpu-device", type=str, default="cpu")
+    submit_seg.add_argument("--job-name", type=str, default="brain_seg")
+    submit_seg.add_argument("--partition", type=str, default=None)
+    submit_seg.add_argument("--account", type=str, default=None)
+    submit_seg.add_argument("--qos", type=str, default=None)
+    submit_seg.add_argument("--time", type=str, default="02:00:00")
+    submit_seg.add_argument("--cpus", type=int, default=4)
+    submit_seg.add_argument("--mem", type=str, default="24G")
+    submit_seg.add_argument("--gres", type=str, default=None)
+    submit_seg.add_argument("--constraint", type=str, default=None)
+    submit_seg.add_argument("--chdir", type=Path, default=None)
+    submit_seg.add_argument("--logs-dir", type=Path, default=ROOT / "slurm_logs")
+    submit_seg.add_argument("--dry-run", action="store_true")
+    submit_seg.set_defaults(func=cmd_submit_seg)
+
+    status = sub.add_parser("status", help="Show SLURM queue/accounting status")
+    status.add_argument("--user", type=str, default=None)
+    status.add_argument("--job-ids", type=str, default=None, help="Comma-separated job IDs for sacct lookup")
+    status.set_defaults(func=cmd_status)
+
+    logs = sub.add_parser("logs", help="Show pipeline/SLURM logs")
+    logs.add_argument("--path", type=Path, required=True, help="Log file or directory")
+    logs.add_argument("--lines", type=int, default=80)
+    logs.set_defaults(func=cmd_logs)
+
+    models = sub.add_parser("models", help="Run one or many BrainIAC downstream tasks locally")
+    src_models = models.add_mutually_exclusive_group(required=True)
+    src_models.add_argument("--input", type=Path)
+    src_models.add_argument("--input-dir", type=Path)
+    models.add_argument("--tasks", type=str, default="all", help="Comma list or 'all'")
+    models.add_argument("--output-dir", type=Path, required=True)
+    models.add_argument("--checkpoint-map", type=str, default=None, help="task=/path/file.ckpt comma-separated")
+    models.add_argument("--config-path", type=Path, default=DEFAULT_CONFIG)
+    models.add_argument("--simclr-checkpoint-path", type=Path, default=DEFAULT_SIMCLR_CKPT)
+    models.add_argument("--gpu-device", type=str, default="cpu")
+    models.add_argument("--layer", type=int, default=-1)
+    models.add_argument("--img-size", nargs=3, type=int, default=(96, 96, 96))
+    models.add_argument("--patch-size", type=int, default=16)
+    models.add_argument("--fail-fast", action="store_true")
+    models.set_defaults(func=cmd_models)
+
+    submit_models = sub.add_parser("submit-models", help="Submit one or many BrainIAC tasks to SLURM")
+    submit_models.add_argument("--input-dir", type=Path, required=True)
+    submit_models.add_argument("--tasks", type=str, default="all", help="Comma list or 'all'")
+    submit_models.add_argument("--output-dir", type=Path, required=True)
+    submit_models.add_argument("--checkpoint-map", type=str, default=None, help="task=/path/file.ckpt comma-separated")
+    submit_models.add_argument("--config-path", type=Path, default=DEFAULT_CONFIG)
+    submit_models.add_argument("--simclr-checkpoint-path", type=Path, default=DEFAULT_SIMCLR_CKPT)
+    submit_models.add_argument("--gpu-device", type=str, default="cpu")
+    submit_models.add_argument("--layer", type=int, default=-1)
+    submit_models.add_argument("--img-size", nargs=3, type=int, default=(96, 96, 96))
+    submit_models.add_argument("--patch-size", type=int, default=16)
+    submit_models.add_argument("--job-prefix", type=str, default="brain_task")
+    submit_models.add_argument("--partition", type=str, default=None)
+    submit_models.add_argument("--account", type=str, default=None)
+    submit_models.add_argument("--qos", type=str, default=None)
+    submit_models.add_argument("--time", type=str, default="02:00:00")
+    submit_models.add_argument("--cpus", type=int, default=4)
+    submit_models.add_argument("--mem", type=str, default="24G")
+    submit_models.add_argument("--gres", type=str, default=None)
+    submit_models.add_argument("--constraint", type=str, default=None)
+    submit_models.add_argument("--chdir", type=Path, default=None)
+    submit_models.add_argument("--logs-dir", type=Path, default=ROOT / "slurm_logs")
+    submit_models.add_argument("--dry-run", action="store_true")
+    submit_models.set_defaults(func=cmd_submit_models)
+
+    # Single-task shortcuts.
+    for name, help_text in [
+        ("age", "Run brain-age task"),
+        ("brainage", "Run brain-age task"),
+        ("idh", "Run IDH task"),
+        ("mci", "Run MCI task"),
+        ("stroke", "Run stroke task"),
+        ("sequence", "Run sequence-classification task"),
+        ("survival", "Run survival task"),
+        ("seg", "Run segmentation task"),
+    ]:
+        p = sub.add_parser(name, help=help_text)
+        _add_models_common_args(p)
+        p.set_defaults(func=cmd_single_task_alias)
+
+    # Multi-task shorthand with positional tasks.
+    run_tasks = sub.add_parser("run-tasks", help="Run multiple tasks in one command")
+    run_tasks.add_argument("task_names", nargs="+", help="Task names, e.g. segmentation brainage idh")
+    _add_models_common_args(run_tasks)
+    run_tasks.set_defaults(func=cmd_run_tasks)
+
+    return parser
+
+
+def main() -> None:
+    if not RUN_SCRIPT.exists():
+        raise SystemExit(f"Missing required script: {RUN_SCRIPT}")
+    if not SUBMIT_SCRIPT.exists():
+        raise SystemExit(f"Missing required script: {SUBMIT_SCRIPT}")
+
+    parser = build_parser()
+    args = parser.parse_args()
+    rc = args.func(args)
+    raise SystemExit(rc)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local data and model artifacts
+Data_Brain/
+sample_inputs/
+checkpoints_real/
+Brain_model_paper.pdf
+
+# Runtime outputs/logs
+outputs*/
+slurm_logs/
+
+# Local experiments
+outputs_idh_pred_test/
+
+# Upstream cloned repository and bundled checkpoints
+BrainIAC_upstream/
